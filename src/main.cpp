@@ -462,6 +462,55 @@ static void patternBorder(){
   Serial.println("[CMD] border pattern");
 }
 
+static void patternCenterCross(){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  memset(frame,0xFF,sizeof(frame));
+  uint16_t effW = curW>296?296:curW; uint16_t effH=curH>160?160:curH;
+  uint16_t cx = effW/2; uint16_t cy = effH/2;
+  for(uint16_t x=0;x<effW;x++) setPixel(x, cy, true);       // pozioma
+  for(uint16_t y=0;y<effH;y++) setPixel(cx, y, true);       // pionowa
+  drawText("M",2,2);
+  epd_push();
+  Serial.println("[CMD] center cross");
+}
+
+// Diagnostyka kolumn – pojedyncza pionowa linia na wskazanym indeksie
+static void patternColumnSingle(uint16_t col){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  memset(frame,0xFF,sizeof(frame));
+  uint16_t effW = curW>296?296:curW; uint16_t effH=curH>160?160:curH;
+  if(col<effW){ for(uint16_t y=0;y<effH;y++) setPixel(col,y,true); }
+  drawText("CS",2,2);
+  epd_push();
+  Serial.print("[CMD] column single col="); Serial.println(col);
+}
+
+// Blok kilku kolumn od start (np. do detekcji przesunięcia / offsetu)
+static void patternColumnBlock(uint16_t start,uint16_t width){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  memset(frame,0xFF,sizeof(frame));
+  uint16_t effW = curW>296?296:curW; uint16_t effH=curH>160?160:curH;
+  for(uint16_t x=0; x<width && (start+x)<effW; ++x){ for(uint16_t y=0;y<effH;y++) setPixel(start+x,y,true); }
+  drawText("CB",2,2);
+  epd_push();
+  Serial.print("[CMD] column block start="); Serial.print(start); Serial.print(" w="); Serial.println(width);
+}
+
+// Pionowa szczotka – zapala kolejne kolumny (co kilka) by znaleźć mapowanie
+static void patternVerticalSweep(uint16_t step){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  uint16_t effW = curW>296?296:curW; uint16_t effH=curH>160?160:curH;
+  for(uint16_t col=0; col<effW; col+=step){
+    memset(frame,0xFF,sizeof(frame));
+    for(uint16_t y=0;y<effH;y++) setPixel(col,y,true);
+    if(col+1<effW) for(uint16_t y=0;y<effH;y++) setPixel(col+1,y,true); // para dla lepszej widoczności
+    epd_push();
+    Serial.print("[SWP] col="); Serial.println(col);
+    delay(250);
+  }
+  Serial.println("[SWP] vertical sweep done");
+}
+
 static void testResolutionVariants(){
   Serial.println("[RES] start");
   for(size_t i=0;i<sizeof(resList)/sizeof(resList[0]);++i){
@@ -508,6 +557,10 @@ static void serialCommands(){
   case 'o': case 'O': g_swapWriteOrder=!g_swapWriteOrder; Serial.print("[CMD] swap write order -> "); Serial.println(g_swapWriteOrder?"13->10":"10->13"); break;
   case 'u': case 'U': ultraClear(); break;
   case 'y': case 'Y': polarityBands(); break;
+  case 'c': patternColumnSingle( (uint16_t) (rand()%112) ); break;
+  case 'C': patternColumnBlock(0,4); break;
+  case 'v': patternVerticalSweep(4); break;
+  case 'm': case 'M': patternCenterCross(); break;
   case 'd': case 'D': g_dataDebug=!g_dataDebug; Serial.print("[CMD] data debug -> "); Serial.println(g_dataDebug?"ON":"OFF"); break;
   case 'f': case 'F': g_fullStream=!g_fullStream; Serial.print("[CMD] full stream -> "); Serial.println(g_fullStream?"ON":"OFF"); break;
   case 't': case 'T': Serial.print("[STAT] BUSY="); Serial.print(digitalRead(PIN_BUSY)); Serial.print(" STATUS=0x"); Serial.println(epd_status(),HEX); break;
@@ -651,7 +704,8 @@ void setup() {
   Serial.println("[EPD] UC8151 manual mode");
   ledSetDimGreen();
   Serial.println("[HELP] Komendy: 0 cyfry,1 litery,2 paski,3 orient,4 clean,5 white,6 res,7 border,r reinit,i invert,x transpose,h help");
-  Serial.println("[INFO] Dodatkowe: b=czarny w=bialy 9=altPush o=swapOrder u=ultraClear y=polBands d=dbg f=full t=stat1");
+  Serial.println("[INFO] Dodatkowe: b=czarny w=bialy 9=altPush o=swapOrder u=ultraClear y=polBands c=col C=colBlk v=vsweep d=dbg f=full t=stat1");
+  Serial.println("[INFO] Extra2: m=centerCross");
 }
 
 void loop() {
