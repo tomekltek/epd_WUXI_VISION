@@ -35,6 +35,8 @@ static inline void diagDelayWait(uint32_t ms){
   while(millis()-t0<ms) delay(1);
 #endif
 }
+// Globalny timeout BUSY (ms)
+#define EPD_BUSY_TIMEOUT_MS 5000
 static void ledSetDimGreen(){ neo.setPixelColor(0, neo.Color(0, 40, 0)); neo.show(); }
 static void ledSetBlue(){ neo.setPixelColor(0, neo.Color(0,0,40)); neo.show(); }
 static void ledSetRed(){ neo.setPixelColor(0, neo.Color(40,0,0)); neo.show(); }
@@ -84,7 +86,7 @@ void epd_wait() {
   bool active = g_busyActiveLow ? LOW : HIGH;
   uint32_t t0 = millis();
   while(digitalRead(PIN_BUSY)==active){
-    if(millis()-t0>10000){ Serial.println("[EPD] BUSY timeout 10s"); break; }
+    if(millis()-t0>EPD_BUSY_TIMEOUT_MS){ Serial.println("[EPD] BUSY timeout 5s"); break; }
     delay(5);
   }
   delay(2);
@@ -131,6 +133,24 @@ static bool g_transpose=false; // zamiana x<->y przy rysowaniu
 static bool g_invertBits=false; // inwersja bitów (0<->1) w buforze logicznym
 static bool g_autoStatus=false; // czy okresowo wypisywać STAT
 static bool g_inited=false;     // czy panel zainicjalizowany
+static bool g_altPush=false;    // tryb alternatywnego wypełniania old buffer (0x10)
+static bool g_swapWriteOrder=false; // zamiana kolejności zapisu 0x10/0x13
+static bool g_dataDebug=false;      // szczegółowe logowanie danych
+static bool g_fullStream=false;     // wypisuj każdy bajt (wolne!)
+
+// Prosty FNV-1a hash dla strumienia (8-bit)
+static uint32_t fnv1a_hash(const uint8_t* d,size_t n){
+  uint32_t h=2166136261u; for(size_t i=0;i<n;i++){ h^=d[i]; h*=16777619u; } return h; }
+
+// Zliczanie bajtów: różne wartości w strumieniu
+struct ByteStats{ uint16_t count[256]; };
+static void byteStatsReset(ByteStats &bs){ memset(&bs,0,sizeof(bs)); }
+static void byteStatsFeed(ByteStats &bs,const uint8_t* d,size_t n){ for(size_t i=0;i<n;i++) bs.count[d[i]]++; }
+static void byteStatsPrint(const char* tag,const ByteStats &bs){
+  Serial.print("[DBG] "); Serial.print(tag); Serial.print(" nonzero bytes: ");
+  int shown=0; for(int i=0;i<256;i++){ if(bs.count[i]){ Serial.print(i); Serial.print('='); Serial.print(bs.count[i]); Serial.print(' '); if(++shown>=24){ Serial.print("..."); break; } } }
+  Serial.println();
+}
 // Framebuffer and drawing utilities (moved up for scope)
 static uint8_t frame[296 * 160 / 8];
 static void setPixel(int x,int y,bool black){
@@ -178,10 +198,100 @@ static void epd_pattern_half(){
   }
 }
 static void epd_push(){
-  // Referencja: 0x10 stary bufor – wypełnia jasne, ale w ref było 0x00 (białe tło definicyjnie odwrotnie). Spróbujemy 0x00.
-  epd_cmd(0x10); for(size_t i=0;i<sizeof(frame);++i) epd_data(0x00);
-  epd_cmd(0x13); for(size_t i=0;i<sizeof(frame);++i) epd_data(frame[i]);
-  epd_cmd(0x12); diagDelayWait(900); epd_wait(); Serial.println("[EPD] Refresh done");
+  Serial.print("[EPD] push begin BUSY="); Serial.print(digitalRead(PIN_BUSY));
+  Serial.print(" order="); Serial.print(g_swapWriteOrder?"13->10":"10->13");
+  Serial.print(" old="); Serial.print(g_altPush?"FF":"00");
+  Serial.print(" dbg="); Serial.println(g_dataDebug?"ON":"OFF");
+
+  ByteStats bsOld, bsNew; byteStatsReset(bsOld); byteStatsReset(bsNew);
+  uint32_t hOld=0, hNew=0;
+  const uint8_t oldFill = g_altPush?0xFF:0x00;
+
+  auto dumpSample=[&](const char* tag,const uint8_t* buf,size_t n){
+    Serial.print("[DBG] "); Serial.print(tag); Serial.print(" sample(32): ");
+    size_t lim = n<32?n:32; for(size_t i=0;i<lim;i++){ if(i) Serial.print(' '); uint8_t b=buf[i]; if(b<16) Serial.print('0'); Serial.print(b,HEX);} Serial.println();
+  };
+
+  if(g_swapWriteOrder){
+    // NEW first
+    epd_cmd(0x13);
+    for(size_t i=0;i<sizeof(frame);++i){
+      uint8_t b = frame[i];
+      epd_data(b);
+      if(g_dataDebug){ if(g_fullStream){ Serial.print("N"); if(b<16) Serial.print('0'); Serial.print(b,HEX); Serial.print(' ');} bsNew.count[b]++; }
+    }
+    if(g_dataDebug){ hNew=fnv1a_hash(frame,sizeof(frame)); dumpSample("NEW",frame,sizeof(frame)); }
+    // OLD after
+    epd_cmd(0x10);
+    for(size_t i=0;i<sizeof(frame);++i){
+      epd_data(oldFill);
+      if(g_dataDebug){ if(g_fullStream){ Serial.print("O"); if(oldFill<16) Serial.print('0'); Serial.print(oldFill,HEX); Serial.print(' ');} bsOld.count[oldFill]++; }
+    }
+    if(g_dataDebug){ uint8_t tmp[32]; memset(tmp,oldFill,32); dumpSample("OLD",tmp,32); }
+  }else{
+    // OLD first
+    epd_cmd(0x10);
+    for(size_t i=0;i<sizeof(frame);++i){
+      epd_data(oldFill);
+      if(g_dataDebug){ if(g_fullStream){ Serial.print("O"); if(oldFill<16) Serial.print('0'); Serial.print(oldFill,HEX); Serial.print(' ');} bsOld.count[oldFill]++; }
+    }
+    if(g_dataDebug){ uint8_t tmp[32]; memset(tmp,oldFill,32); dumpSample("OLD",tmp,32); }
+    // NEW second
+    epd_cmd(0x13);
+    for(size_t i=0;i<sizeof(frame);++i){
+      uint8_t b = frame[i];
+      epd_data(b);
+      if(g_dataDebug){ if(g_fullStream){ Serial.print("N"); if(b<16) Serial.print('0'); Serial.print(b,HEX); Serial.print(' ');} bsNew.count[b]++; }
+    }
+    if(g_dataDebug){ hNew=fnv1a_hash(frame,sizeof(frame)); dumpSample("NEW",frame,sizeof(frame)); }
+  }
+
+  if(g_dataDebug){
+    byteStatsPrint("OLD",bsOld); byteStatsPrint("NEW",bsNew);
+    Serial.print("[DBG] HASH_NEW=0x"); Serial.println(hNew,HEX);
+  }
+  epd_cmd(0x12);
+  diagDelayWait(900); epd_wait(); Serial.println("[EPD] Refresh done");
+  if(g_dataDebug && g_fullStream) Serial.println(); // newline after stream
+  Serial.print("[EPD] push end BUSY="); Serial.println(digitalRead(PIN_BUSY));
+}
+
+// Bardzo agresywne czyszczenie: różne polaryzacje i kolejności zapisu
+static void ultraClear(){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  bool origAlt=g_altPush; bool origOrder=g_swapWriteOrder;
+  Serial.println("[CLR] Ultra clear start");
+  for(int phase=0; phase<6; ++phase){
+    g_altPush = (phase & 1);          // naprzemiennie 0x00/0xFF
+    g_swapWriteOrder = (phase & 2);   // co dwa kroki zmiana kolejności
+    memset(frame, (phase & 4)?0x00:0xFF, sizeof(frame)); // w ostatnich dwóch fazach (phase>=4) wymuś pełne czarne
+    Serial.print("[CLR] phase="); Serial.print(phase);
+    Serial.print(" alt="); Serial.print(g_altPush);
+    Serial.print(" swap="); Serial.print(g_swapWriteOrder);
+    Serial.print(" frameFill="); Serial.println((phase & 4)?"BLACK":"WHITE");
+    epd_push();
+    delay(300);
+  }
+  // Przywróć domyślne
+  g_altPush=origAlt; g_swapWriteOrder=origOrder;
+  memset(frame,0xFF,sizeof(frame)); epd_push();
+  Serial.println("[CLR] Ultra clear end (final WHITE push)");
+}
+
+// Test połówek z dwiema kolejnymi polaryzacjami old buffer
+static void polarityBands(){
+  if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; }
+  // Faza 1: altPush=0 (old=0x00)
+  g_altPush=false; memset(frame,0xFF,sizeof(frame));
+  for(int y=0;y<80;y++) for(int x=0;x<curW && x<296;x++) setPixel(x,y,true); // górna połowa czarna
+  epd_push(); delay(500);
+  // Faza 2: altPush=1 (old=0xFF)
+  g_altPush=true; memset(frame,0xFF,sizeof(frame));
+  for(int y=80;y<160 && y<curH;y++) for(int x=0;x<curW && x<296;x++) setPixel(x,y,true); // dolna połowa czarna
+  epd_push(); delay(500);
+  // Reset
+  g_altPush=false; memset(frame,0xFF,sizeof(frame)); epd_push();
+  Serial.println("[CLR] polarity bands done");
 }
 static void epd_sweep(){
   // Funkcja nieużywana w trybie MULTI_DRIVER_DEBUG – pozostawiona dla zgodności
@@ -392,6 +502,15 @@ static void serialCommands(){
       case '7': patternBorder(); break;
   case 'r': case 'R': epd_power_off_deep(); delay(300); epd_init_variant(variants[2]); g_inited=true; Serial.println("[CMD] reinit 112x208 ref"); break;
   case 's': case 'S': g_autoStatus=!g_autoStatus; Serial.print("[CMD] auto status -> "); Serial.println(g_autoStatus?"ON":"OFF"); break;
+  case 'b': case 'B': if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; } memset(frame,0xFF,sizeof(frame)); for(size_t i=0;i<sizeof(frame);++i) frame[i]=0x00; epd_push(); Serial.println("[CMD] force black"); break; 
+  case 'w': case 'W': if(!g_inited){ epd_init_variant(variants[2]); g_inited=true; } memset(frame,0xFF,sizeof(frame)); epd_push(); Serial.println("[CMD] force white"); break; 
+  case '9': g_altPush=!g_altPush; Serial.print("[CMD] altPush -> "); Serial.println(g_altPush?"FF old":"00 old"); break;
+  case 'o': case 'O': g_swapWriteOrder=!g_swapWriteOrder; Serial.print("[CMD] swap write order -> "); Serial.println(g_swapWriteOrder?"13->10":"10->13"); break;
+  case 'u': case 'U': ultraClear(); break;
+  case 'y': case 'Y': polarityBands(); break;
+  case 'd': case 'D': g_dataDebug=!g_dataDebug; Serial.print("[CMD] data debug -> "); Serial.println(g_dataDebug?"ON":"OFF"); break;
+  case 'f': case 'F': g_fullStream=!g_fullStream; Serial.print("[CMD] full stream -> "); Serial.println(g_fullStream?"ON":"OFF"); break;
+  case 't': case 'T': Serial.print("[STAT] BUSY="); Serial.print(digitalRead(PIN_BUSY)); Serial.print(" STATUS=0x"); Serial.println(epd_status(),HEX); break;
       case 'i': case 'I':
         g_invertBits = !g_invertBits; Serial.print("[CMD] invert toggled -> "); Serial.println(g_invertBits?"ON":"OFF"); patternDigits(); break;
       case 'x': case 'X':
@@ -532,6 +651,7 @@ void setup() {
   Serial.println("[EPD] UC8151 manual mode");
   ledSetDimGreen();
   Serial.println("[HELP] Komendy: 0 cyfry,1 litery,2 paski,3 orient,4 clean,5 white,6 res,7 border,r reinit,i invert,x transpose,h help");
+  Serial.println("[INFO] Dodatkowe: b=czarny w=bialy 9=altPush o=swapOrder u=ultraClear y=polBands d=dbg f=full t=stat1");
 }
 
 void loop() {
